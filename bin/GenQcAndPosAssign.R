@@ -317,7 +317,7 @@ if (is.null(PLINK2) || PLINK2 == "" || !file.exists(PLINK2)) {
   dir.create("plink")
 
   # Download plink 2 executable
-  utils::download.file("https://s3.amazonaws.com/plink2-assets/plink2_linux_x86_64_20251115.zip",
+  utils::download.file("https://s3.amazonaws.com/plink2-assets/alpha6/plink2_linux_x86_64_20250915.zip",
                        destfile = "plink/plink2.zip", verbose = TRUE)
   PLINK2 <- utils::unzip("plink/plink2.zip",
                         files = "plink2",
@@ -336,7 +336,7 @@ if (is.null(PLINK) || PLINK == "" || !file.exists(PLINK)) {
   dir.create("plink")
   
   # Download plink 1.9 executable
-  utils::download.file("https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20220402.zip",
+  utils::download.file("https://s3.amazonaws.com/plink1-assets/plink_linux_x86_64_20250819.zip",
   destfile = "plink/plink.zip", verbose = TRUE)
   PLINK <- utils::unzip("plink/plink.zip",
                           files = "plink",
@@ -375,7 +375,7 @@ system(paste0(PLINK2, " --bfile ", ref_1000g_prefix, " --threads 4 --freq 'cols=
 
 if ("hg19" != ucsc_code) {
   target_frequencies <- fread("1000Gref.afreq", sep="\t", data.table=F, header=T,
-                 col.names=c("chr", "pos", "ID", "REF", "ALT", "ALT_FREQS", "OBS_CT"))
+                 col.names=c("chr", "pos", "ID", "REF", "ALT", "PROVISIONAL_REF", "ALT_FREQS", "OBS_CT"))
 
 if (!is.null(args$chain_path) && args$chain_path != "") {
   target_frequencies_mapped <- snp_modifyBuild2(
@@ -545,7 +545,7 @@ snp_plinkQC(
   mind = 0.05,
   hwe = 1e-6,
   autosome.only = FALSE,
-  extra.options = paste0("--output-chr 26 --not-chr 0 25-26 --set-all-var-ids ", variant_format, " --new-id-max-allele-len 10 truncate --threads 4"),
+  extra.options = paste0("--output-chr 26 --not-chr 0 25-26 --set-all-var-ids ", variant_format, " --new-id-max-allele-len 20 truncate --threads 4"),
   verbose = TRUE
 )
 
@@ -563,7 +563,7 @@ ref_bed <- bed(paste0(ref_1000g_prefix, ".bed"))
 target_bed <- bed(paste0(bed_simplepath, "_QC.bed"))
 target_bed$.fam <- read_fam(paste0(bed_simplepath, "_QC"))
 
-temp_QC <- data.frame(stage = "SNP CR>0.95; HWE P>1e-6; MAF>0.01; GENO<0.05; MIND<0.05", Nr_of_SNPs = target_bed$ncol, Nr_of_samples = target_bed$nrow,
+temp_QC <- data.frame(stage = "SNP QC: HWE P>1e-6; MAF>0.01; GENO<0.05; MIND<0.05", Nr_of_SNPs = target_bed$ncol, Nr_of_samples = target_bed$nrow,
 Nr_of_eQTL_samples = nrow(gte[gte$V1 %in% target_bed$.fam$`sample.ID`, ]))
 
 summary_table <- rbind(summary_table, temp_QC)
@@ -805,9 +805,17 @@ pos = map_new_lifted$pos,
 a1 = map_new_lifted$a1,
 a0 = map_new_lifted$a0)
 
-fwrite(lifted_bim[!is.na(lifted_bim$pos), ], "lifted_map.bim", sep = "\t", col.names = FALSE, row.names = FALSE)
+# Drop variants whose ID collides (from --set-all-var-ids truncating long indel alleles to the same
+# chr:pos[build]ref,alt string). plink --update-map errors on duplicate IDs in the update file, and
+# bed_projectPCA below joins by position anyway, so removing the few colliding variants is safe.
+dup_ids <- unique(lifted_bim$rsid[duplicated(lifted_bim$rsid) | duplicated(lifted_bim$rsid, fromLast = TRUE)])
+writeLines(dup_ids, "pca_dup_ids.txt")
+fwrite(lifted_bim[!is.na(lifted_bim$pos) & !(lifted_bim$rsid %in% dup_ids), ], "lifted_map.bim", sep = "\t", col.names = FALSE, row.names = FALSE)
 
-system(paste0(PLINK,  " --bfile ",  bed_simplepath, "_QC --update-chr lifted_map.bim 1 2 --update-map lifted_map.bim 4 2 --make-bed --out temp_for_PCA"))
+# Remove the ID-colliding variants in a SEPARATE pass first: plink1.9 validates ID-uniqueness for
+# --update-map independently of --exclude, so exclude+update in one command still errors "Duplicate ID".
+system(paste0(PLINK,  " --bfile ",  bed_simplepath, "_QC --exclude pca_dup_ids.txt --make-bed --out temp_for_PCA_nodup"))
+system(paste0(PLINK,  " --bfile temp_for_PCA_nodup --update-chr lifted_map.bim 1 2 --update-map lifted_map.bim 4 2 --make-bed --out temp_for_PCA"))
 
 proj_PCA <- bed_projectPCA(
   obj.bed.ref = ref_bed,
@@ -1065,7 +1073,7 @@ if (length(related_individuals) > 0) {
   indices_of_passed_samples <- indices_of_het_passed_samples
 }
 
-temp_QC <- data.frame(stage = "Relatedness for eQTL samples: thr. KING>2^-4.5", Nr_of_SNPs = target_bed$ncol,
+temp_QC <- data.frame(stage = "Relatedness for sQTL samples: thr. KING>2^-4.5", Nr_of_SNPs = target_bed$ncol,
 Nr_of_samples = length(indices_of_passed_samples),
 Nr_of_eQTL_samples = nrow(gte[gte$V1 %in% het_s[!het_s$ID %in% samples_to_remove_due_to_relatedness, ]$ID, ])
 )
@@ -1250,7 +1258,7 @@ summary_table <- rbind(summary_table, temp_QC)
 
 # Write out final summary
 message("Write out final sample summary table.")
-colnames(summary_table) <- c("Stage", "Nr. of SNPs", "Nr. of genotype samples", "Nr. of eQTL samples")
+colnames(summary_table) <- c("Stage", "Nr. of SNPs", "Nr. of genotype samples", "Nr. of sQTL samples")
 fwrite(summary_table, paste0(args$output, "/gen_data_summary/summary_table.txt"), sep = "\t", quote = FALSE)
 
 system("rm *.bed", wait = TRUE, intern = FALSE)

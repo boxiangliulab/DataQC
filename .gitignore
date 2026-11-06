@@ -1,0 +1,18 @@
+# Nextflow run artifacts
+work/
+.nextflow/
+.nextflow.log*
+output/
+output_*/
+logs/
+
+# Singularity / Nextflow caches
+singularitycache/
+nextflowcache/
+*.sif
+*.img
+
+# Misc
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,6 +1,11 @@
-# eQTLGen data QC pipeline
+# eQTLGen sQTL (splicing) data QC pipeline
 
-Automatic data quality check and processing for unimputed genotype data and unprocessed gene expression data.
+Automatic data quality check and processing for unimputed genotype data, **splicing phenotypes** and gene
+expression. This is a splicing (sQTL) adaptation of the eQTLGen [DataQC](https://github.com/eQTLGen/DataQC)
+pipeline: the genotype QC is unchanged, a **splicing QC** step replaces the expression QC as the primary
+phenotype, and expression QC is retained (now active) — it detects and removes sample outliers (expression
+PCA/MDS outliers and sex/contamination mismatches) and, together with the genotype and splicing QC, defines
+the final shared analysed sample set.
 
 Performs the following main steps:
 
@@ -16,19 +21,24 @@ Performs the following main steps:
   - Visualisation of samples in the genetic reference space, instructions how to remove or split the data in case of multi-ancestry samples.
   - Removal of in-sample genetic outliers.
   - Calculates 10 first genetic principal components (PCs), used in analyses as covariates to correct for population stratification.
-- Gene expression:
-  - Aligns sample IDs between genotype samples and gene expression samples.
-  - Filters in blood-expressed genes.
-  - Replaces array probe IDs with gene IDs.
-  - Iteratively checks for expression outliers and removes samples which fail this check.
-  - Appropriately normalises the data according to the expression platform used and applies additional inverse normal transformation.
-  - Calculates 100 first expression PCs, used in analyses as covariates to correct for unknown variation.
-  - Calculates the expression summary statistics for each gene, used to do *post-hoc* QC and gene filtering in the meta-analysis.
+- Splicing (primary sQTL phenotype):
+  - Aligns sample IDs between genotype and splicing samples (via the gte file), restricting to genotype-QC'd samples.
+  - QCs the combined splice-site (PSI) matrix assembled in Stage 0 (`0_SplicingPhenotype`).
+  - Iterative PCA / MDS outlier detection to remove sample outliers (run on the most-variable junctions, so standard PCA fits in modest memory — no Gram/dual PCA needed).
+  - **Pre-filters the PCA basis** to well-measured features (per-site missingness < 0.10 **and** mean read depth per donor >= 5) before selecting the top (default 20,000) most-variable junctions, so the covariate PCs are driven by robust phenotypes rather than low-depth / high-missingness artifacts.
+  - Per-feature rank inverse-normal transform (INT) of the full junction matrix (the phenotype).
+  - Calculates 50 splicing PCs, used in analyses as covariates to correct for unknown variation.
+  - Computes per-site read-depth & missingness summaries (junction + intron-retention), used for *post-hoc* QC in the meta-analysis.
+- Gene expression (sample-level QC):
+  - Aligns to the splicing-QC'd samples; CPM-filters, TMM-normalises and applies per-gene inverse normal transformation.
+  - **Active QC**: iteratively removes expression PCA / MDS outlier samples.
+  - The final analysed sample set is the intersection **genotype &cap; splicing &cap; expression**; the splicing phenotype and covariate PCs are re-aligned to this set.
+  - Calculates up to 100 expression PCs and writes out the processed expression matrix.
 - Additional steps:
   - Removes samples whose genetic sex does not match with the expression of sex-specific genes.
   - Reorders the genotype samples into random order.
   - Organises all the QCd data into the standard folder format.
-  - Provides commented `html` QC report which should be used to get an overview of the quality of the data.
+  - Provides a single commented `html` QC report (genotype + splicing + expression) which should be used to get an overview of the quality of the data.
 
 ## Usage information
 
@@ -43,160 +53,109 @@ Performs the following main steps:
 
 You can either clone it by using git (if available in HPC):
 
-`git clone https://github.com/eQTLGen/DataQC.git`
+`git clone https://github.com/boxiangliulab/DataQC.git`
 
 Or just download this from the gitlab/github download link and unzip.
 
 ### Input files
 
-- Unimputed genotype file in plink `.bed` format (https://www.cog-genomics.org/plink/1.9/input#bed). Genome build has to be in **hg19/GRCh37 (default)** or **hg38/GRCh38**. It is advisable that .fam file also includes observed sex for all samples (format: males=1, females=2), so that pipeline does extra check on that. However, if this information is not available for all samples, pipeline just skips this check. Input path has to be without `.bed/.bim/.fam` extension. 
+- Unimputed genotype file in plink `.bed` format (https://www.cog-genomics.org/plink/1.9/input#bed). Genome build has to be in **hg19/GRCh37 (default)** or **hg38/GRCh38**. It is advisable that .fam file also includes observed sex for all samples (format: males=1, females=2), so that pipeline does extra check on that. However, if this information is not available for all samples, pipeline just skips this check. Input path has to be without `.bed/.bim/.fam` extension.
 - We also allow unimputed `.vcf` datasets as input, specifically for WGS datasets for which we can do WGS-specific variant level QC. If your dataset concerns a VCF dataset, replace the `--bfile` argument with the `--vcf` argument. The `--vcf` argument expects a full path to a `.vcf` dataset. Pathname extension using globbing is allowed (using `*` or `?`), but the path should be provided without pathway extension.
-- Raw, unprocessed gene expression matrix. Tab-delimited file, genes/probes in the rows, samples in the columns.
-  - First column has header "-".
-  - For Illumina arrays, probe ID has to be Illumina ArrayAddress.
-  - For RNA-seq, gene ID has to be stable ENSEMBL gene ID (ENSEMBL v75).
-  - For Affymetrix arrays we expect that gene **expression matrix has already gone through the standard preprocessing** and is in the same format as was used in eQTLGen phase 1 analyses (incl. array probe names).
-- Genotype-to-expression linking file (gte). Tab-delimited file, no header, 2 columns: sample ID in genotype data, corresponding sample ID in gene expression data.
+- **Splicing phenotypes** produced by Stage 0 (`0_SplicingPhenotype`): the combined splice-site (PSI) matrix (`combined_matrix/<cohort>_combined_splice_site.txt.gz`) and the raw `.site` read-count files (`03_phenotype/<cohort>.site`, `04_IR/<cohort>_IR.site`). These are located automatically from `--splice_pheno_dir` by cohort name (or override individually with `--combined_matrix` / `--junction_site` / `--ir_site`).
+- **Gene expression matrix**: raw, unprocessed gene counts (RNA-seq; genes in rows with stable ENSEMBL gene IDs, samples in columns), used for the expression-based sample QC. Provided via `--expression_matrix` (defaults to the Stage-0 location by cohort name).
+- Genotype-to-expression linking file (gte). Tab-delimited, no header, 2 columns: sample ID in genotype data, corresponding sample ID in the RNA (splicing/expression) data.
 
 ### Required inputs
 
 `--cohort_name`                 Name of the cohort.
 
-`--bfile`                       Path to the unimputed genotype files in plink bed/bim/fam format (without extensions bed/bim/fam).
+`--bfile`                       Path to the unimputed genotype files in plink bed/bim/fam format (without extensions). Use `--vcf` instead for a VCF/WGS dataset.
 
 `--genome_build`                Genome build of the cohort. Either hg19, GRCh37, hg38 or GRCh38. Defaults to hg19.
 
-`--expfile`                     Path to the un-preprocessed gene expression matrix (genes/probes in the rows, samples in the columns). Can be from RNA-seq experiment or from array. NB! For Affymetrix arrays (AffyU219, AffyExon) we assume that standard preprocessing and normalisation is already done.
+`--gen_qc_steps`                `Array` (default; generic SNP-array QC) or `WGS` (generic + WGS-specific QC; only valid with VCF datasets).
+
+`--splice_pheno_dir`            Path to the Stage-0 (`0_SplicingPhenotype`) output folder. The combined splice matrix, gene-count matrix and raw `.site` files are derived from it by cohort name.
+
+`--expression_matrix`           Path to the raw gene-count matrix (RNA-seq) used for the expression-based sample QC.
 
 `--gte`                         Genotype-to-expression linking file. Tab-delimited, no header. First column: sample ID for genotype data. Second column: corresponding sample ID for gene expression data. Can be used to filter samples from the analysis.
-
-`--exp_platform`                Gene expression platform. HT12v3, HT12v4, HuRef8, RNAseq, AffyU219, AffyHumanExon.
 
 `--outdir`                      Path to the output directory.
 
 ### Additional settings
 
-There are five arguments which can be used to adjust certain outlier detection thresholds. These should be adjusted after initial run with the default settings and after investigating the diagnostic plots in the `Report_DataQc_[cohort name].html`. Then the pipeline should be re-run with adjusted settings.
+There are six arguments which can be used to adjust certain outlier detection thresholds. These should be adjusted after initial run with the default settings and after investigating the diagnostic plots in the `Report_DataQc_[cohort name].html`. Then the pipeline should be re-run with adjusted settings.
 
-`--GenOutThresh` Threshold for declaring genotype sample genetic outlier, based on LOF "outlierness" metric. Default is 0.4.
+`--GenOutThresh`        Threshold for a genotype sample genetic outlier, based on the LOF "outlierness" metric. Default 0.4.
 
-`--GenSdThresh` Threshold for declaring genotype sample genetic outlier, based on the deviation from the means of first two genetic PCs. Defaults to 3 SD from the mean.
+`--GenSdThresh`         Threshold for a genotype sample genetic outlier, based on deviation from the mean of the first two genetic PCs. Default 3 SD.
 
-`--ExpSdThresh` Threshold for declaring expression sample outlier, based on the deviation from the means of first two expression PCs. Defaults to 4 SD from the mean.
+`--sd_threshold`        SD threshold for splicing / expression PCA/MDS sample-outlier detection. Default 4.
 
-`--ContaminationArea` Threshold for declaring samples as contaminated based on X chr vs Y chr gene expression plot. Defaults to 30 degrees, meaning that samples which have high expression of both, X chr and Y chr genes are likely to be contaminated.
+`--ExpSdThresh`         SD threshold for expression sample outliers. Default 4.
+
+`--ContaminationArea`   Threshold (degrees) for declaring samples contaminated from the X-vs-Y chromosome expression plot. Default 30.
+
+`--ContaminationSlope`  Slope (degrees, 0-90) of the line separating males/females in that plot. Default 45.
 
 Optional arguments:
 
-`--gen_qc_steps` Either generic, array-based, QC or including also WGS specific QC (only valid with VCF datasets). 'Array' (default) or 'WGS' (Generic + WGS qc).
+`--expr_remove_outliers` `true` (default) = **active** expression QC: expression PCA/MDS and sex/contamination outliers are removed and the splicing set is re-aligned to the genotype &cap; splicing &cap; expression intersection. `false` = diagnostic only (flagged, not removed; splicing QC alone defines the set).
 
-`--AdditionalCovariates` Tab-separated file with additional external covariates deemed to be relevant for eQTL mapping in given dataset. First column must have header "SampleID" and following columns must include corresponding covariates with informative headers (E.g. "GenotypeBatch", etc.). Categorical covariates must be specified in the text format (E.g. "Batch1", "Batch2", "Batch3"), not encoded as numbers. Pipeline does one-hot encoding for you. Numerical covariates are allowed as well. If specified, this file should include covariate information for each eQTL sample which passes QC and NAs are not allowed. 
+`--max_pca_missingness` / `--min_pca_meancount`  Splicing-PCA pre-filter cutoffs (defaults 0.10 and 5): a feature enters the top-features PCA basis only if its per-site missingness is below `max_pca_missingness` and its mean read depth per donor is at least `min_pca_meancount`.
 
-`--InclusionList` File with the genotype IDs to keep in the analysis (one per row). Useful for e.g. keeping in only the samples which have part of the biobank, etc. By default, pipeline keeps all samples in. No header needed.
+`--num_gen_pcs` / `--num_splicing_pcs` / `--num_expression_pcs`  Number of PCs written to the covariate files. Defaults 10 / 50 / 100.
 
-`--ExclusionList` File with the genotype IDs to remove from the analysis (one per row). Useful for removing part of the samples from the analysis if these are from different ancestry. In case of the overlap between inclusion list and exclusion list, intersect is kept in the analysis. No header needed.
+`--int_transform`       Apply the per-feature rank-INT to the splicing phenotype. Default true.
 
-`--preselected_sex_check_vars`  Path to a plink ranges file that defines which variants to use for the check-sex command. Use this when the automatic selection does not yield satisfactory results.
+`--AdditionalCovariates` Tab-separated file with additional covariates (first column header `SampleID`, following columns named covariates; categorical values as text, one-hot encoded for you). Must cover every QC-passing sample, no NAs.
 
-`--plink_executable`    Path to plink executable. By default this is automatically downloaded from internet. Use this setting when you have to work offline.
+`--InclusionList` / `--ExclusionList`  Files with genotype IDs to keep / remove (one per row, no header). On overlap, the intersection is kept.
 
-`--plink2_executable`   Path to plink2 executable. By default this is automatically downloaded from internet. Use this setting when you have to work offline.
+`--preselected_sex_check_vars`  plink ranges file defining which variants to use for the sex check.
 
-`--reference_1000g_folder`  Path to 1000g reference folder. By default this is automatically downloaded from internet. Use this setting when you have to work offline.
+`--fam`                 PLINK `.fam` file; takes precedence over the `.fam` supplied with `--bfile`.
+
+`--plink_executable` / `--plink2_executable` / `--reference_1000g_folder`  Local paths to plink / plink2 / the 1000G reference; by default these are downloaded automatically. Use when working offline.
+
+`--chain_path`          Folder with the `hg19ToHg38`/`hg38ToHg19` liftOver chain files. Only needed for **hg38/GRCh38** cohorts (to align the hg19 1000G reference); hg19 cohorts never use it. By default the chain is fetched automatically, but a local copy (e.g. `deps/chain`) is more robust where the download is unreachable.
 
 ### Running the data QC command
 
-Go to folder `dataqc` and modify the Slurm script template `submit_DataQc_pipeline_template.sh` with your input paths. Below is an example template for Slurm scheduler. Some of the paths are pre-filled, assuming that you follow [eQTLGen phase II cookbook](https://github.com/eQTLGen/eQTLGen-phase-2-cookbook/wiki/eQTLGen-phase-II-cookbook) and its recommended folder structure, however you can also use custom paths.
+Modify the submit template `submit_DataQc_pipeline_template.sh` with your input paths. The template defaults
+to a PBS scheduler; commented examples for loading the environment (conda / modules) and for other schedulers
+are included. Only a few variables need filling (cohort name, genotype input, gte, build, Stage-0 folder);
+the PC counts and thresholds come from the pipeline defaults above and can be overridden by adding the flag.
+
+The core command is:
 
 ```bash
-#!/bin/bash
-
-#SBATCH --time=48:00:00
-#SBATCH -N 1
-#SBATCH --ntasks-per-node=1
-#SBATCH --mem=6G
-#SBATCH --mail-type=BEGIN
-#SBATCH --mail-type=END
-#SBATCH --mail-type=FAIL
-#SBATCH --job-name="DataQc"
-
-# These are needed modules in UT HPC to get singularity and Nextflow running. Replace with appropriate ones for your HPC.
-module load java-1.8.0_40
-module load singularity/3.5.3
-module load squashfs/4.4
-
-# If you follow the eQTLGen phase II cookbook and analysis folder structure,
-# some of the following paths are pre-filled.
-# https://github.com/eQTLGen/eQTLGen-phase-2-cookbook/wiki/eQTLGen-phase-II-cookbook
-
-# We set the following variables for nextflow to prevent writing to your home directory (and potentially filling it completely)
-# Feel free to change these as you wish.
-export SINGULARITY_CACHEDIR=../../singularitycache
-export NXF_HOME=../../nextflowcache
-
-# Disable pathname expansion. Nextflow handles pathname expansion by itself.
-set -f
-
-# Define paths
-nextflow_path=../../tools # folder where Nextflow executable is
-
-# Genotype data
-bfile_path=[full path to your input genotype files without .bed/.bim/.fam extension]
-
-# Other data
-exp_path=[full path to your gene expression matrix]
-gte_path=[full path to your genotype-to-expression file]
-exp_platform=[expression platform name: HT12v3/HT12v4/HuRef8/RNAseq/AffyU219/AffyHumanExon]
-cohort_name=[name of the cohort]
-genome_build="GRCh37"
-output_path=../output # Output path
-
-# Additional settings and optional arguments for the command
-
-# --GenOutThresh [numeric threshold]
-# --GenSdThresh [numeric threshold]
-# --ExpSdThresh [numeric threshold]
-# --ContaminationArea [number between 0 and 90, default 30]
-# --AdditionalCovariates [file with additional covariates]
-# --InclusionList [file with the list of samples to restrict the analysis]
-# --ExclusionList [file with the list of samples to remove from the analysis]
-# --preselected_sex_check_vars "data/Affy6_pruned_chrX_variant_positions.txt"
-# --AdditionalCovariates [file with additional covariates. First column should be `SampleID`]
-# --gen_qc_steps 'WGS'
-# --fam [PLINK .fam file. Takes precedence over .fam file supplied with `--bfile`]
-# --plink_executable [path to plink executable (PLINK v1.90b6.26 64-bit)]
-# --plink2_executable [path to plink2 executable (PLINK v2.00a3.7LM 64-bit Intel)]
-# --reference_1000g_folder [path to folder with 1000G reference data]
-
-# Command:
 NXF_VER=21.10.6 ${nextflow_path}/nextflow run DataQC.nf \
---bfile ${geno_path} \
---expfile ${exp_path} \
---gte ${gte_path} \
---exp_platform ${exp_platform} \
---cohort_name ${cohort_name} \
---outdir ${output_path}  \
--profile slurm,singularity \
--resume
+  $geno_arg --cohort_name "$cohort_name" --genome_build "$genome_build" --gen_qc_steps "$gen_qc_steps" \
+  --splice_pheno_dir "$splice_pheno_dir" --expression_matrix "$expression_matrix" --gte ${gte_path} \
+  --outdir ${output_path} \
+  -profile ${NEXTFLOW_PROFILES} -resume \
+  -with-report logs/dataqc_report.html -with-trace logs/dataqc_trace.txt
 ```
 
-You can save the modified script version to informative name, e.g. `submit_DataQc_[**CohortName_PlatformName**].sh`.
-
-You can select HPC scheduler type by adjusting the profile as following:
+where `$geno_arg` is `--bfile <path>` (default) or `--vcf <path>`. Select the HPC scheduler via the profile:
 
 - Slurm: `-profile slurm,singularity`
 - PBS/TORQUE: `-profile pbs,singularity`
 - SGE: `-profile sge,singularity`
 
-Then submit the job `sbatch submit_DataQc_[**CohortName_PlatformName**].sh`. This initiates pipeline, makes analysis environment (using singularity) and automatically submits the steps in correct order and parallel way. Separate `work` directory is made to the folder and contains all interim files.
+Submit the script (e.g. `qsub submit_DataQc_pipeline_template.sh`). This initiates the pipeline, builds the
+analysis environment (Singularity) and submits the steps in the correct order; a separate `work` directory
+holds all interim files. On a crash (e.g. walltime) just resubmit — Nextflow resumes from incomplete steps.
 
 ### Monitoring and debugging
 
 - Monitoring:
-  - Monitor the `slurm-***.out` log file and check if all the steps finish without error. Trick: command `watch tail -n 20 slurm-***.out` helps you to interactively monitor the status of the jobs.
-  - Use `squeue -u [YourUserName]` to see if individual tasks are in the queue.
+  - Monitor the scheduler log file (e.g. `1_dataqc.o[JobID]` on PBS) and check if all the steps finish without error. Trick: command `watch tail -n 20 1_dataqc.o[JobID]` helps you to interactively monitor the status of the jobs.
+  - Use `qstat -u [YourUserName]` to see if individual tasks are in the queue.
 - If the pipeline crashes (e.g. due to walltime), you can just resubmit the same script after the fixes. Nextflow does not rerun completed steps and continues only from the steps which had not completed.
-- When the work has finished, download and check the job report. This file  is automatically written to your output folder `pipeline_info` subfolder, for potential errors or warnings. E.g. `output/pipeline_info/DataQcReport.html`.
+- When the work has finished, download and check the job report. This file is automatically written when the pipeline is run with `-with-report`, for potential errors or warnings. E.g. `logs/dataqc_report.html`.
 - When you need to do some debugging, then you can use the last section of aforementioned report to figure out in which subfolder from `work` folder the actual step was run. You can then navigate to this folder and investigate the following hidden files:
   - `.command.sh`: script which was submitted.
   - `.command.log`: log file for seeing the analysis outputs/errors.
@@ -208,57 +167,42 @@ Pipeline makes the following output (most relevant files outlined):
 
 ```
 |--output
-    |--outputfolder_exp
-        |--exp_data_QCd
-            |--exp_data_preprocessed.txt
-        |--exp_PCs
-            |--exp_PCs.txt
-        |--exp_data_summary
-            |--raw_gene_summary.txt
-            |--processed_gene_summary.txt
-            |--...
-        |--exp_plots
-            |--...
     |--outputfolder_gen
-        |--gen_data_QCd
-            |--*_ToImputation.bed
-            |--*_ToImputation.bim
-            |--*_ToImputation.fam
-            |--*_ToImputation.log
-        |--gen_PCs
-            |--GenotypePCs.txt
-        |--gen_data_summary
-            |--1000G_PC_projections.txt
-            |--...
-        |--gen_plots
-            |--...
-    |--pipeline_info
-        |--DataQc_report.html
-        |--...
+        |--gen_data_QCd/*_ToImputation.{bed,bim,fam,log}
+        |--gen_PCs/GenotypePCs.txt
+        |--gen_data_summary/ ...
+        |--gen_plots/ ...
+    |--outputfolder_splice
+        |--splice_data_QCd/splice_data_preprocessed.txt   (samples x junctions, rank-INT phenotype)
+        |--splice_PCs/splicing_PCs.txt
+        |--splice_data_summary/ (summary_table.txt, site_readcount_summary_*.tsv, ...)
+        |--splice_plots/ ...
+    |--outputfolder_exp
+        |--exp_data_QCd/exp_data_preprocessed.txt         (processed expression matrix)
+        |--exp_PCs/exp_PCs.txt
+        |--exp_data_summary/ (raw_gene_summary.txt, processed_gene_summary.txt, ...)
+        |--exp_plots/ ...
+    |--CovariatePCs.Splicing.txt      (genotype PCs + splicing PCs + GenSex)
+    |--CovariatePCs.Expression.txt    (genotype PCs + expression PCs + GenSex)
     |--Report_DataQc_[cohort name].html
-    |--CovariatesPCs.txt
+    |--pipeline_info/ ...
 ```
 
 #### Steps to take
 
-1. Investigate the file `Report_DataQc*.html`, fix any issues with the genotype/gene expression data according to the plots and instructions. You can adjust three arguments of the pipeline to adjust certain outlier detection thresholds according to your data.
+1. Investigate `Report_DataQc_[cohort name].html`, fix any genotype / splicing / expression issues according to the plots and instructions (adjust the threshold arguments above and re-run if needed).
 
-2. If data had any quality issues, re-run the pipeline when issues are removed, check the `Report_DataQc.html` again.
+2. If data had quality issues, re-run once resolved and re-check the report.
 
 When all issues are solved:
 
-3. Files: `output/outputfolder_gen/gen_data_QCd/*_ToImputation.bed`, `output/outputfolder_gen/gen_data_QCd/*_ToImputation.bim`, `output/outputfolder_gen/gen_data_QCd/*_ToImputation.fam` are the filtered and QCd genotype files which need to be the input for imputation pipeline `https://gitlab.com/eqtlgen-group/eqtlgen-imputation-pipeline`
+3. `output/outputfolder_gen/gen_data_QCd/*_ToImputation.{bed,bim,fam}` are the QCd genotype files for the imputation pipeline (`https://gitlab.com/eqtlgen-group/eqtlgen-imputation-pipeline`).
 
-4. The whole folder `output` should be specified as an input for per-cohort preparations and encoding pipeline `https://gitlab.com/eqtlgen-group/PerCohortPreparations`. This pipeline automatically uses the processed, QCd expression data and covariate file to run data encoding and partial derivative calculation. It then organises the encoded matrices for sharig with central site. It also extracts some QC files for sharing with the central site:
-- `output/Report_DataQc_[cohort name].html`: most important data QC report, used in central site to check the per-cohort QC information.
-- `output/outputfolder_exp/exp_data_summary/raw_gene_summary.txt`: gene expression summary statistics (mean, median, sd, min, max, nr of unique values, Shapiro test P) before normalisation, used in central site to filter out lowly expressed genes, genes having outliers, etc.
-- `output/outputfolder_exp/exp_data_summary/processed_gene_summary.txt`: gene expression summary statistics (mean, median, sd, min, max, nr of unique values, Shapiro test P) after normalisation, used in central site to filter out lowly expressed genes, genes having outliers, etc.
-- `output/outputfolder_gen/plots/*`, `output/outputfolder_exp/plots/*`: Separate diagnostic plots which can be later used in the manuscript materials.
-- `output/pipeline_info/DataQc_report.html`: Technical pipeline runtime report, used for checking if pipeline finished successfully.. It is not automatically added to shared folder, however it can be used in the central site for debugging, if the need arises. 
+4. The whole `output` folder is the input for the per-cohort preparations / encoding pipeline, which uses the QCd splicing phenotype + covariate files to run the sQTL encoding and partial-derivative calculation, and extracts QC files for sharing with the central site — most importantly `Report_DataQc_[cohort name].html` and the per-site/per-gene summary statistics.
 
 ## Genotype QC only
 
-To simply only do genotype QC without the expression QC use `DataQCgenoOnly.nf`
+To only run genotype QC without the splicing / expression QC, use `DataQCgenoOnly.nf` (inherited from upstream; not adapted/validated for the splicing report).
 
 ## Acknowledgements
 
@@ -278,4 +222,6 @@ Gene expression processing makes use of [preprocesscore](https://bioconductor.or
 
 ### Contacts
 
-For this Nextflow pipeline: urmo.vosa at gmail.com.
+For this splicing (sQTL) adaptation: Tian Chi, e1101920@u.nus.edu.
+
+For the original eQTLGen DataQC pipeline: urmo.vosa at gmail.com.

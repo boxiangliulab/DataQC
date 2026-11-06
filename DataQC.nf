@@ -107,17 +107,14 @@ if (params.fam != '') {
 
 }
 
-Channel
-    .from(params.expfile)
-    .map { study -> [file("${study}")]}
-    .ifEmpty { exit 1, "Input expression files not found!" }
-    .set { expfile_ch }
+// Splicing/expression input channels (combined_matrix_ch, expression_matrix_ch, junction_site_ch,
+// ir_site_ch) are created further below, after the params block, from a single --splice_pheno_dir.
 
 Channel
     .from(params.gte)
     .map { study -> [file("${study}")]}
     .ifEmpty { exit 1, "Input GTE file not found!" }
-    .into { gte_ch_gen; gte_ch_exp }
+    .into { gte_ch_gen; gte_ch_exp; gte_ch_exp2 }
 
 Channel
     .fromPath(params.report_template)
@@ -166,12 +163,56 @@ params.ContaminationSlope = 45
 params.ContaminationArea = 30
 params.exp_platform = ''
 params.cohort_name = ''
+
+// Splicing QC + covariate params (the splicing analog of the expression-QC inputs)
+params.combined_matrix = ''
+params.sd_threshold = 4
+params.int_transform = true
+params.num_gen_pcs = 10
+params.num_splicing_pcs = 50
+params.n_top_features = 20000      // TOP-FEATURES variant: splicing PCA/MDS use the N most-variable junctions
+params.max_pca_missingness = 0.10  // PRE-FILTER: splicing-PCA basis keeps features with per-site missingness < this
+params.min_pca_meancount   = 5     // PRE-FILTER: splicing-PCA basis keeps features with mean raw read depth/donor >= this
+params.num_expression_pcs = 100   // eQTLGen uses up to 100 expression PCs in the covariate file
+// Optional cohort-specific covariates folded into CovariatePCs.Splicing/Expression.txt (MakeCovariateFile.R behaviour).
+// Sentinel 1000G_pops.txt = none supplied (matches the reference default).
+params.AdditionalCovariates = "$baseDir/data/1000G_pops.txt"
 params.outdir = ''
 params.genome_build = 'hg19'
 
 // By default define random non-colliding file names in data folder. If default, these are ignored by corresponding script.
 params.InclusionList = "$baseDir/data/EmpiricalProbeMatching_AffyHumanExon.txt"
 params.ExclusionList = "$baseDir/data/EmpiricalProbeMatching_AffyU219.txt"
+
+// ---- Stage-0 splicing + expression inputs ----
+// A single --splice_pheno_dir (the 0_SplicingPhenotype/output folder) derives everything by cohort_name:
+//   combined_matrix/<cohort>_combined_splice_site.txt.gz   (QC'd splice input)
+//   expression_matrix/<cohort>_gene_counts.txt.gz          (raw gene counts, for expression QC + 4_ permuted/LD path)
+//   03_phenotype/<cohort>.site  +  04_IR/<cohort>_IR.site  (raw counts, for the splice read-count/missingness summary)
+// Any of these can be overridden explicitly via --combined_matrix / --expression_matrix / --junction_site / --ir_site.
+params.splice_pheno_dir    = ''
+params.expression_matrix   = ''
+params.junction_site       = ''
+params.ir_site             = ''
+params.expr_remove_outliers = true    // ACTIVE expression QC: remove expr PCA/MDS/sex/contamination outliers, then
+                                       // re-align the splicing set to the intersection (geno n splice n expr) via FINALIZE_SPLICING
+
+def _spd = params.splice_pheno_dir
+def combined_matrix_path   = (params.combined_matrix   && params.combined_matrix   != '') ? params.combined_matrix   : "${_spd}/combined_matrix/${params.cohort_name}_combined_splice_site.txt.gz"
+def expression_matrix_path = (params.expression_matrix && params.expression_matrix != '') ? params.expression_matrix : "${_spd}/expression_matrix/${params.cohort_name}_gene_counts.txt.gz"
+def junction_site_path     = (params.junction_site     && params.junction_site     != '') ? params.junction_site     : "${_spd}/03_phenotype/${params.cohort_name}.site"
+def ir_site_path           = (params.ir_site           && params.ir_site           != '') ? params.ir_site           : "${_spd}/04_IR/${params.cohort_name}_IR.site"
+
+Channel.fromPath(combined_matrix_path)
+    .ifEmpty { exit 1, "Combined splice matrix not found: ${combined_matrix_path}" }
+    .set { combined_matrix_ch }
+Channel.fromPath(expression_matrix_path)
+    .ifEmpty { exit 1, "Expression matrix not found: ${expression_matrix_path}" }
+    .set { expression_matrix_ch }
+// .site files are large and optional: if absent, fall back to a sentinel so the splice QC still runs;
+// compute_site_readcount_summary.py simply skips a file that has no include:total fields.
+Channel.fromPath(junction_site_path).ifEmpty { file("${baseDir}/data/1000G_pops.txt") }.set { junction_site_ch }
+Channel.fromPath(ir_site_path).ifEmpty { file("${baseDir}/data/1000G_pops.txt") }.set { ir_site_ch }
 params.AdditionalCovariates = "$baseDir/data/1000G_pops.txt"
 
 params.preselected_sex_check_vars = ''
@@ -454,8 +495,8 @@ process GenotypeQC {
 
     output:
       path ('outputfolder_gen') into output_ch_genotypes
-      file 'outputfolder_gen/gen_data_QCd/SexCheck.txt' into sexcheck
-      file 'outputfolder_gen/gen_data_QCd/*fam' into sample_qc
+      file 'outputfolder_gen/gen_data_QCd/SexCheck.txt' into (sexcheck, sexcheck_expr)
+      file 'outputfolder_gen/gen_data_QCd/*fam' into (sample_qc, sample_qc_expr)
       file '1000Gref.afreq.gz' into ref_allele_frequencies
       file 'target.afreq.gz' into target_allele_frequencies
 
@@ -493,124 +534,150 @@ process GenotypeQC {
     
 }
 
-process GeneExpressionQC {
+process SPLICING_SAMPLE_QC {
 
-    tag {GeneExpressionQC}
+    tag {SPLICING_SAMPLE_QC}
 
     input:
-      file exp_mat from expfile_ch
+      file combined_matrix from combined_matrix_ch
       file gte from gte_ch_exp
-      file sexcheck from sexcheck
       file geno_filter from sample_qc
-      val exp_platform from params.exp_platform
-      val sd from params.ExpSdThresh
-      val contamination_area from params.ContaminationArea
-      val contamination_slope from params.ContaminationSlope
+      file junction_site from junction_site_ch
+      file ir_site from ir_site_ch
 
     output:
-      path ('outputfolder_exp') into output_ch_geneexpression
-      file 'SexCheck.txt' into sexcheck_to_report
+      path ('outputfolder_splice') into (output_ch_splicing_for_finalize, output_ch_splicing_for_expr)
 
     script:
-      if (exp_platform == 'HT12v3')
-      """
-      Rscript --vanilla $baseDir/bin/ProcessExpression.R  \
-      --expression_matrix ${exp_mat} \
-      --genotype_to_expression_linking ${gte} \
-      --sex_info ${sexcheck} \
-      --geno_filter ${geno_filter} \
-      --platform ${exp_platform} \
-      --sd ${sd} \
-      --contamination_slope ${contamination_slope} \
-      --contamination_area ${contamination_area} \
-      --emp_probe_mapping $baseDir/data/EmpiricalProbeMatching_IlluminaHT12v3.txt \
+    """
+    mkdir -p outputfolder_splice outputfolder_splice/splice_data_summary
+
+    # Analysed feature ids = the combined-matrix row ids (junction_<id> / IR_<id>). Used to restrict
+    # the per-site read-count summary to the analysed set AND to feed the splicing-PCA pre-filter.
+    zcat -f ${combined_matrix} | cut -f1 | tail -n +2 > feature_ids.txt
+
+    # Splicing-specific summary FIRST: per-site RAW read-count depth + missingness (junction & IR), from
+    # the Stage-0 .site files, restricted to the analysed feature set. Runs BEFORE ProcessSplicing so the
+    # splicing-PCA pre-filter can select a well-measured basis. (Skips gracefully if a .site is absent.)
+    python3 $baseDir/bin/compute_site_readcount_summary.py \\
+      --junction_site ${junction_site} \\
+      --ir_site ${ir_site} \\
+      --keep_sites feature_ids.txt \\
+      --output_dir outputfolder_splice/splice_data_summary
+
+    # Splicing QC (ProcessSplicing.R = ProcessExpression.R analog): PCA/MDS outlier QC + per-feature
+    # rank-INT. geno_filter (gen_data_QCd/*_ToImputation.fam) restricts QC to the genotyped samples,
+    # exactly like ProcessExpression.R does for expression. This QC defines the analysed sample set.
+    # --site_summary_dir enables the PRE-FILTER: the top-features PCA basis is restricted to features with
+    # missingness < max_pca_missingness AND mean_count >= min_pca_meancount (full matrix still written out).
+    Rscript --vanilla $baseDir/bin/ProcessSplicing.R \\
+      --psi_matrix ${combined_matrix} \\
+      --gte ${gte} \\
+      --geno_filter ${geno_filter} \\
+      --sd ${params.sd_threshold} \\
+      --int_transform ${params.int_transform} \\
+      --n_top_features ${params.n_top_features} \\
+      --site_summary_dir outputfolder_splice/splice_data_summary \\
+      --max_pca_missingness ${params.max_pca_missingness} \\
+      --min_pca_meancount ${params.min_pca_meancount} \\
+      --output_dir outputfolder_splice
+
+    # Transpose features x samples -> samples x features (eQTLGen/HASE format)
+    python3 $baseDir/bin/transpose_matrix.py \\
+      --input outputfolder_splice/splice_data_QCd/splice_data_preprocessed.txt \\
+      --output outputfolder_splice/splice_data_QCd/splice_data_preprocessed_T.txt \\
+      --junction_list outputfolder_splice/splice_data_QCd/junction_list.txt
+    mv outputfolder_splice/splice_data_QCd/splice_data_preprocessed_T.txt outputfolder_splice/splice_data_QCd/splice_data_preprocessed.txt
+
+    md5sum outputfolder_splice/splice_data_QCd/* > outputfolder_splice/splice_data_QCd/md5sums.txt
+    """
+}
+
+process EXPRESSION_SAMPLE_QC {
+
+    tag {EXPRESSION_SAMPLE_QC}
+
+    publishDir "${params.outdir}", mode: 'copy', overwrite: true
+
+    input:
+      file expression_matrix from expression_matrix_ch
+      file gte from gte_ch_exp2
+      path output_splice from output_ch_splicing_for_expr
+      file sexcheck from sexcheck_expr
+      file geno_filter from sample_qc_expr
+
+    output:
+      path ('outputfolder_exp') into (output_ch_expression, output_ch_expression_for_finalize)
+
+    script:
+    """
+    mkdir -p outputfolder_exp
+
+    # Expression QC: CPM-filter + TMM + per-gene INT (needed for the 4_ permuted/LD path), aligned to the
+    # SPLICING-QC'd sample set; iterative PCA outlier detection is DIAGNOSTIC (reported, not removed,
+    # unless --expr_remove_outliers true). Reads the QC'd splice sample list via cut -f1 (never loads the
+    # wide splice matrix). Normalization + outlier logic mirror eQTLGen ProcessExpression.R.
+    Rscript --vanilla $baseDir/bin/ProcessExpression.R \\
+      --expression_matrix ${expression_matrix} \\
+      --gte ${gte} \\
+      --sample_list ${output_splice}/splice_data_QCd/splice_data_preprocessed.txt \\
+      --sd ${params.sd_threshold} \\
+      --remove_outliers ${params.expr_remove_outliers} \\
+      --sex_info ${sexcheck} \\
+      --emp_probe_mapping $baseDir/data/EmpiricalProbeMatching_RNAseq.txt \\
+      --contamination_area ${params.ContaminationArea} \\
+      --contamination_slope ${params.ContaminationSlope} \\
+      --geno_filter ${geno_filter} \\
       --output outputfolder_exp
-      md5sum outputfolder_exp/exp_data_QCd/* > outputfolder_exp/exp_data_QCd/md5sums.txt
-      """
-      else if (exp_platform == 'HT12v4')
-      """
-      Rscript --vanilla $baseDir/bin/ProcessExpression.R  \
-      --expression_matrix ${exp_mat} \
-      --genotype_to_expression_linking ${gte} \
-      --sex_info ${sexcheck} \
-      --geno_filter ${geno_filter} \
-      --platform ${exp_platform} \
-      --contamination_slope ${contamination_slope} \
-      --contamination_area ${contamination_area} \
-      --emp_probe_mapping $baseDir/data/EmpiricalProbeMatching_IlluminaHT12v4.txt \
-      --output outputfolder_exp
-      md5sum outputfolder_exp/exp_data_QCd/* > outputfolder_exp/exp_data_QCd/md5sums.txt
-      """
-      else if (exp_platform == 'HuRef8')
-      """
-      Rscript --vanilla $baseDir/bin/ProcessExpression.R  \
-      --expression_matrix ${exp_mat} \
-      --genotype_to_expression_linking ${gte} \
-      --sex_info ${sexcheck} \
-      --geno_filter ${geno_filter} \
-      --platform ${exp_platform} \
-      --contamination_slope ${contamination_slope} \
-      --contamination_area ${contamination_area} \
-      --emp_probe_mapping $baseDir/data/EmpiricalProbeMatching_IlluminaHuRef8.txt \
-      --output outputfolder_exp
-      md5sum outputfolder_exp/exp_data_QCd/* > outputfolder_exp/exp_data_QCd/md5sums.txt
-      """
-      else if (exp_platform == 'RNAseq')
-      """
-      Rscript --vanilla $baseDir/bin/ProcessExpression.R  \
-      --expression_matrix ${exp_mat} \
-      --genotype_to_expression_linking ${gte} \
-      --sex_info ${sexcheck} \
-      --geno_filter ${geno_filter} \
-      --platform ${exp_platform} \
-      --contamination_slope ${contamination_slope} \
-      --contamination_area ${contamination_area} \
-      --emp_probe_mapping $baseDir/data/EmpiricalProbeMatching_RNAseq.txt \
-      --output outputfolder_exp
-      md5sum outputfolder_exp/exp_data_QCd/* > outputfolder_exp/exp_data_QCd/md5sums.txt
-      """
-      else if (exp_platform == 'AffyU219')
-      """
-      Rscript --vanilla $baseDir/bin/ProcessExpression.R  \
-      --expression_matrix ${exp_mat} \
-      --genotype_to_expression_linking ${gte} \
-      --sex_info ${sexcheck} \
-      --geno_filter ${geno_filter} \
-      --platform ${exp_platform} \
-      --contamination_slope ${contamination_slope} \
-      --contamination_area ${contamination_area} \
-      --emp_probe_mapping $baseDir/data/EmpiricalProbeMatching_AffyU219.txt \
-      --output outputfolder_exp
-      md5sum outputfolder_exp/exp_data_QCd/* > outputfolder_exp/exp_data_QCd/md5sums.txt
-      """
-      else if (exp_platform == 'AffyHumanExon')
-      """
-      Rscript --vanilla $baseDir/bin/ProcessExpression.R  \
-      --expression_matrix ${exp_mat} \
-      --genotype_to_expression_linking ${gte} \
-      --sex_info ${sexcheck} \
-      --geno_filter ${geno_filter} \
-      --platform ${exp_platform} \
-      --contamination_slope ${contamination_slope} \
-      --contamination_area ${contamination_area} \
-      --emp_probe_mapping $baseDir/data/EmpiricalProbeMatching_AffyHumanExon.txt \
-      --output outputfolder_exp
-      md5sum outputfolder_exp/exp_data_QCd/* > outputfolder_exp/exp_data_QCd/md5sums.txt 
-      """
-      else if (exp_platform == 'RNAseq_HGNC')
-      """
-      Rscript --vanilla $baseDir/bin/ProcessExpression.R  \
-      --expression_matrix ${exp_mat} \
-      --genotype_to_expression_linking ${gte} \
-      --sex_info ${sexcheck} \
-      --geno_filter ${geno_filter} \
-      --platform ${exp_platform} \
-      --contamination_slope ${contamination_slope} \
-      --contamination_area ${contamination_area} \
-      --emp_probe_mapping $baseDir/data/HgncToEnsemblProbeMatching.txt \
-      --output outputfolder_exp
-      md5sum outputfolder_exp/exp_data_QCd/* > outputfolder_exp/exp_data_QCd/md5sums.txt
-      """
+
+    md5sum outputfolder_exp/exp_data_QCd/* > outputfolder_exp/exp_data_QCd/md5sums.txt
+    """
+}
+
+process FINALIZE_SPLICING {
+
+    tag {FINALIZE_SPLICING}
+
+    input:
+      path output_splice from output_ch_splicing_for_finalize
+      path output_exp    from output_ch_expression_for_finalize
+
+    output:
+      path ('outputfolder_splice') into output_ch_splicing
+
+    script:
+    """
+    # ACTIVE expression QC (mod 1): re-align the splicing phenotype + covariate PCs to the final analysed
+    # set E = genotype n splice n expression-QC (exp_data_summary/final_samples.txt). Rank-INT is monotone,
+    # so re-ranking the already-INT'd phenotype restricted to E is BIT-EXACT INT-on-E (no raw-matrix
+    # re-read). If expression QC removed nothing, this is an idempotent no-op.
+    # Replace the staged input symlink with a writable copy so edits never touch upstream work files.
+    cp -rL outputfolder_splice _splice_final
+    rm outputfolder_splice
+    mv _splice_final outputfolder_splice
+
+    cd outputfolder_splice/splice_data_QCd
+    # The on-disk phenotype is WIDE (samples x up-to-~670k features); data.table::fread segfaults on that
+    # many columns and pandas.read_csv OOMs (per-column overhead). transpose_matrix_np.py reads the WIDE
+    # with numpy (compact) and writes the TALL, so R can fread the tall (few columns) and re-INT per feature;
+    # the TALL->WIDE step below uses pandas (the output is tall-read, few columns, safe). junction_list regen'd.
+    python3 $baseDir/bin/transpose_matrix_np.py \\
+      --input splice_data_preprocessed.txt --output _tall.txt --junction_list _samples_tmp.txt
+    cd ../..
+
+    Rscript --vanilla $baseDir/bin/finalize_splice_intersection.R \\
+      --tall outputfolder_splice/splice_data_QCd/_tall.txt \\
+      --splice_dir outputfolder_splice \\
+      --final_samples ${output_exp}/exp_data_summary/final_samples.txt \\
+      --num_splicing_pcs ${params.num_splicing_pcs}
+
+    cd outputfolder_splice/splice_data_QCd
+    python3 $baseDir/bin/transpose_matrix.py \\
+      --input _tall.txt --output splice_data_preprocessed.txt --junction_list junction_list.txt
+    rm -f _tall.txt _samples_tmp.txt
+    md5sum splice_data_preprocessed.txt > md5sums.txt
+    cd ../..
+    """
 }
 
 wgs_qc_stats.ifEmpty("EMPTY").collectFile(name: 'wgs_qc_table_combined.txt', skip: 1, newLine: false, keepHeader: true).set { wgs_qc_stats_file_ch }
@@ -624,49 +691,66 @@ process RenderReport {
 
     input:
       path output_gen from output_ch_genotypes
-      path output_exp from output_ch_geneexpression
+      path output_splice from output_ch_splicing
+      path output_expression from output_ch_expression
       path report from report_ch
       path ref_af from ref_allele_frequencies
       path target_af from target_allele_frequencies
-      val exp_platform from params.exp_platform
-      val stresh from params.GenOutThresh
-      val sdtresh from params.GenSdThresh
-      val expsdtresh from params.ExpSdThresh
-      val contaminationarea from params.ContaminationArea
-      val contaminationslope from params.ContaminationSlope
+      path sexcheck from sexcheck
+      val num_gen_pcs from params.num_gen_pcs
+      val num_splicing_pcs from params.num_splicing_pcs
       path additional_covariates from params.AdditionalCovariates
-      path sexcheck from sexcheck_to_report
       file wgs_qc_stats_collected from wgs_qc_stats_file_ch
       file wgs_qc_settings_collected from wgs_qc_settings_file_ch
 
     output:
       path ('outputfolder_gen/*') into output_ch2
-      path ('outputfolder_exp/*') into output_ch3
+      path ('outputfolder_splice/*') into output_ch3
       path ('Report_DataQc*') into report_ch2
-      path ('CovariatePCs.txt') into combined_covariates
+      path ('CovariatePCs.Splicing.txt') into splicing_covariates
+      path ('CovariatePCs.Expression.txt') into expression_covariates
       path ('wgs_qc_table_combined.txt') into wgs_qc_stats_output_ch
       path ('wgs_qc_settings_combined.txt') into wgs_qc_settings_output_ch
 
     script:
     """
-    # Make combined covariate file
-    Rscript --vanilla $baseDir/bin/MakeCovariateFile.R ${sexcheck} "${additional_covariates}"
+    # Two covariate files, one per Stage-4 path (MakeCovariateFile.R analog):
+    #   CovariatePCs.Splicing.txt   = genotype PCs + SPLICING PCs + GenSex (+ additional)  -> empirical/meta-analysis (splicing)
+    #   CovariatePCs.Expression.txt = genotype PCs + EXPRESSION PCs + GenSex (+ additional) -> permuted/LD (expression)
+    python3 $baseDir/bin/generate_covariate_pcs.py \\
+      --genotype_pcs outputfolder_gen/gen_PCs/GenotypePCs.txt \\
+      --splicing_pcs outputfolder_splice/splice_PCs/splicing_PCs.txt \\
+      --pc_prefix SplicingPC \\
+      --gen_sex ${sexcheck} \\
+      --num_gen_pcs ${num_gen_pcs} \\
+      --num_splicing_pcs ${num_splicing_pcs} \\
+      --additional_covariates ${additional_covariates} \\
+      --output CovariatePCs.Splicing.txt
 
-    # Make report
+    python3 $baseDir/bin/generate_covariate_pcs.py \\
+      --genotype_pcs outputfolder_gen/gen_PCs/GenotypePCs.txt \\
+      --splicing_pcs outputfolder_exp/exp_PCs/exp_PCs.txt \\
+      --pc_prefix ExpPC \\
+      --gen_sex ${sexcheck} \\
+      --num_gen_pcs ${num_gen_pcs} \\
+      --num_splicing_pcs ${params.num_expression_pcs} \\
+      --additional_covariates ${additional_covariates} \\
+      --output CovariatePCs.Expression.txt
+
+    # Single DataQC report: genotype QC + splicing QC + expression QC (merged; expression PCA/MDS/scree
+    # are now a section of this report rather than a separate Report_ExpressionDiagnostic).
     cp -L ${report} notebook.Rmd
-
-    R -e 'library(rmarkdown);rmarkdown::render("notebook.Rmd", "html_document", 
-    output_file = "Report_DataQc_${params.cohort_name}.html", 
+    R -e 'library(rmarkdown);rmarkdown::render("notebook.Rmd", "html_document",
+    output_file = "Report_DataQc_${params.cohort_name}.html",
     params = list(
     dataqc_version = "${workflow.manifest.version}",
-    dataset_name = "${params.cohort_name}", 
-    platform = "${exp_platform}", 
-    N = "${output_exp}/exp_data_QCd/exp_data_preprocessed.txt",
-    S = ${stresh},
-    SD = ${sdtresh},
-    SD_exp = ${expsdtresh},
-    Cont = ${contaminationarea},
-    ContSlope = ${contaminationslope}))'
+    dataset_name = "${params.cohort_name}",
+    N = "outputfolder_splice/splice_data_QCd/splice_data_preprocessed.txt",
+    N_expr = "outputfolder_exp/exp_data_summary/summary_table.txt",
+    S = ${params.GenOutThresh},
+    SD = ${params.GenSdThresh},
+    SD_splice = ${params.sd_threshold},
+    SD_exp = ${params.sd_threshold}))'
     """
 }
 
