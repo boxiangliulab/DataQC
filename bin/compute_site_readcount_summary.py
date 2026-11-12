@@ -3,9 +3,14 @@
 compute_site_readcount_summary.py
 
 Splicing-specific DataQC summary that the expression QC has no analogue for: per-splice-site
-RAW read-count statistics (missingness = zero-count fraction, plus total/mean/median/std/min/max
-read depth), computed from the Stage-0 ISSAC `.site` files and restricted to the sites that
-survived QC (i.e. that are present in the QC'd combined splice matrix).
+RAW read-count statistics (missingness = zero-count fraction, plus total/mean/median/min/max
+read DEPTH on the denominator, and `std_ratio` = SD of the PSI RATIO), computed from the Stage-0
+ISSAC `.site` files and restricted to the sites that survived QC (i.e. that are present in the
+QC'd combined splice matrix).
+
+`std_ratio` is the standard deviation of the per-sample splice ratio `(numerator + 0.5) /
+(denominator + 0.5)` over the OBSERVED samples (denominator >= 1), matching the smoothed PSI that
+Stage-0 writes into the phenotype matrix. Count columns remain based on the denominator (depth).
 
 Mirrors issac_bulk.nf COMPUTE_SUMMARY_STATS / COMPUTE_SUMMARY_STATS_IR, but runs inside 1_DataQC so
 the stats are tied to the analysed site set. Streams the (large) `.site` files line by line
@@ -46,31 +51,37 @@ def summarise_site_file(site_path, keep_set, modality, out_tsv):
     n_sites = 0
     with open(site_path) as fin, open(out_tsv, 'w') as fout:
         fout.write('\t'.join(['site_id', 'missingness', 'total_counts', 'mean_count',
-                              'std_count', 'median_count', 'min_count', 'max_count',
+                              'std_ratio', 'median_count', 'min_count', 'max_count',
                               'modality']) + '\n')
         for line in fin:
             fields = line.rstrip('\n').split(' ')
             if len(fields) < 2:
                 continue
             site_id = fields[0]
-            totals = []
+            totals = []       # denominator (read depth) per sample
+            ratios = []       # smoothed PSI ratio over OBSERVED samples (denominator >= 1)
             for fld in fields[1:]:
                 if ':' in fld:
                     parts = fld.split(':')
                     try:
-                        totals.append(int(parts[1]))
+                        num = int(parts[0]); tot = int(parts[1])
                     except (ValueError, IndexError):
-                        totals.append(0)
+                        num = 0; tot = 0
+                    totals.append(tot)
+                    if tot >= 1:
+                        ratios.append((num + 0.5) / (tot + 0.5))
             if not totals:
                 continue  # header line (sample IDs) / malformed -> skip
             if keep_set is not None and site_id not in keep_set:
                 continue
             c = np.array(totals, dtype=float)
+            r = np.array(ratios, dtype=float)
             n = len(c)
             miss = float(np.sum(c == 0)) / n
+            std_ratio = float(r.std(ddof=1)) if r.size > 1 else 0.0
             fout.write('\t'.join([
                 site_id, f"{miss:.6f}", str(int(c.sum())), f"{c.mean():.6f}",
-                f"{(c.std(ddof=1) if n > 1 else 0.0):.6f}", f"{np.median(c):.6f}",
+                f"{std_ratio:.6f}", f"{np.median(c):.6f}",
                 f"{c.min():.6f}", f"{c.max():.6f}", modality]) + '\n')
             miss_all.append(miss)
             depth_all.append(c.mean())
